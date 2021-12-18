@@ -1,4 +1,55 @@
+{-------------------------------------------------------------------------------
+
+  This Source Code Form is subject to the terms of the Mozilla Public
+  License, v. 2.0. If a copy of the MPL was not distributed with this
+  file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+-------------------------------------------------------------------------------}
+{===============================================================================
+
+  Shared named items
+
+  Version 1.0 alpha (2021-12-18)
+
+  Last change 2021-12-18
+
+  ©2021-2022 František Milt
+
+  Contacts:
+    František Milt: frantisek.milt@gmail.com
+
+  Support:
+    If you find this code useful, please consider supporting its author(s) by
+    making a small donation using the following link(s):
+
+      https://www.paypal.me/FMilt
+
+  Changelog:
+    For detailed changelog and history please refer to this git repository:
+
+      github.com/TheLazyTomcat/Lib.NamedSharedItems
+
+  Dependencies:
+    AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
+    AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
+    SHA1               - github.com/TheLazyTomcat/Lib.SHA1
+    SharedMemoryStream - github.com/TheLazyTomcat/Lib.SharedMemoryStream
+    StrRect            - github.com/TheLazyTomcat/Lib.StrRect
+    BitOps             - github.com/TheLazyTomcat/Lib.BitOps
+
+    HashBase           - github.com/TheLazyTomcat/Lib.HashBase
+    StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
+  * SimpleCPUID        - github.com/TheLazyTomcat/Lib.SimpleCPUID
+  * InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
+  * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex      
+
+===============================================================================}
 unit NamedSharedItems;
+
+{$IFDEF FPC}
+  {$MODE ObjFPC}
+{$ENDIF}
+{$H+}
 
 interface
 
@@ -6,11 +57,23 @@ uses
   SysUtils,
   AuxTypes, AuxClasses, SHA1, SharedMemoryStream;
 
+{===============================================================================
+    Library-specific exception
+===============================================================================}
 type
   ENSIException = class(Exception);
 
+  ENSIInvalidValue        = class(ENSIException);
   ENSIItemAllocationError = class(ENSIException);
 
+{===============================================================================
+--------------------------------------------------------------------------------
+                                TNamedSharedItem
+--------------------------------------------------------------------------------
+===============================================================================}
+{===============================================================================
+    TNamedSharedItem - class declaration
+===============================================================================}
 type
   TNamedSharedItem = class(TCustomObject)
   protected
@@ -22,7 +85,7 @@ type
     fDataSection:       TSharedMemory;
     fMemory:            Pointer;
     fPayloadMemory:     Pointer;
-    // some heleper vars
+    // some helper fields
     fFullItemSize:      TMemSize;
     fItemsPerSection:   UInt32;
     Function GetInfoSectionName: String; virtual;
@@ -44,8 +107,13 @@ type
 implementation
 
 uses
-  StrRect;
+  StrRect, BitOps;
 
+{===============================================================================
+--------------------------------------------------------------------------------
+                                TNamedSharedItem
+--------------------------------------------------------------------------------
+===============================================================================}
 {
   Informative section
 }
@@ -73,17 +141,18 @@ const
 
   NSI_INFOSECT_FLAG_ACTIVE = UInt32($00000001);
 
+//------------------------------------------------------------------------------
 {
   Data section
 }
 const
-  NSI_SHAREDMEMORY_DATASECT_ALIGNMENT = 32;
-  NSI_SHAREDMEMORY_DATASECT_SIZE      = 64 * 1024;            // 64KiB
-  NSI_SHAREDMEMORY_DATASECT_NAME      = 'nsi_section_%d_%d';  // size, index
+  NSI_SHAREDMEMORY_DATASECT_MAXITEMSIZE = 1024;                 // 1KiB
+  NSI_SHAREDMEMORY_DATASECT_ALIGNMENT   = 32;
+  NSI_SHAREDMEMORY_DATASECT_SIZE        = 64 * 1024;            // 64KiB
+  NSI_SHAREDMEMORY_DATASECT_NAME        = 'nsi_section_%d_%d';  // size, index
 
 type
   TNSIItemPayload = record end; // zero-size placeholder
-  PNSIItemPayload = ^TNSIItemPayload;
 
   TNSIItemHeader = packed record
     RefCount: UInt32;
@@ -94,7 +163,12 @@ type
   end;
   PNSIItemHeader = ^TNSIItemHeader;
 
-//------------------------------------------------------------------------------
+{===============================================================================
+    TNamedSharedItem - class implementation
+===============================================================================}
+{-------------------------------------------------------------------------------
+    TNamedSharedItem - protected methods
+-------------------------------------------------------------------------------}
 
 Function TNamedSharedItem.GetInfoSectionName: String;
 begin
@@ -132,7 +206,7 @@ Function TNamedSharedItem.ProbeSectionsForItem: Boolean;
                   Result := True;
                   Break{For ii};
                 end;
-            ItemPtr := PNSIItemHeader(PtrUInt(ItemPtr) + PtrUInt(fFullItemSize));
+            PtrAdvanceVar(Pointer(ItemPtr),fFullItemSize);
           end;
       finally
         Section.Unlock;
@@ -199,7 +273,7 @@ For i := Low(InfoSectionPtr^.DataSections) to High(InfoSectionPtr^.DataSections)
                 Inc(InfoSectionPtr^.DataSections[i].ItemCount);
                 Exit;
               end;
-            ItemPtr := PNSIItemHeader(PtrUInt(ItemPtr) + PtrUInt(fFullItemSize));
+            PtrAdvanceVar(Pointer(ItemPtr),fFullItemSize);
           end;
       finally
         fDataSection.Unlock;
@@ -254,7 +328,6 @@ end;
 
 procedure TNamedSharedItem.DeallocateItem;
 begin
-// deallocate item and free sections
 If Assigned(fInfoSection) then
   begin
     fInfoSection.Lock;
@@ -277,7 +350,7 @@ If Assigned(fInfoSection) then
     finally
       fInfoSection.Unlock;
     end;
-FreeAndNil(fInfoSection);
+    FreeAndNil(fInfoSection);
   end;
 end;
 
@@ -287,7 +360,10 @@ procedure TNamedSharedItem.Initialize(const Name: String; Size: TMemSize);
 begin
 fName := Name;
 fNameHash := WideStringSHA1(StrToWide(fName));
-fSize := Size;
+If (Size > 0) and (Size <= NSI_SHAREDMEMORY_DATASECT_MAXITEMSIZE) then
+  fSize := Size
+else
+  raise ENSIInvalidValue.CreateFmt('TNamedSharedItem.Initialize: Invalid item size (%d).',[Size]);
 fInfoSection := nil;
 fDataSectionIndex := -1;
 fDataSection := nil;
@@ -317,7 +393,9 @@ begin
 DeallocateItem;
 end;
 
-//------------------------------------------------------------------------------
+{-------------------------------------------------------------------------------
+    TNamedSharedItem - public methods
+-------------------------------------------------------------------------------}
 
 constructor TNamedSharedItem.Create(const Name: String; Size: TMemSize);
 begin
