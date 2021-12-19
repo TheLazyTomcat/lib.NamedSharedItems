@@ -9,32 +9,40 @@
 
   Shared named items
 
-    Provides a class (TNamedSharedItem) to be used for small named shared
-    (system-wide) memory blocks (here named items).
+    Provides a class (TNamedSharedItem) to be used for creation of small named
+    shared (system-wide) memory blocks (here named items).
 
     It is inteded only for shared objects or medium-size data (at most 1KiB,
-    this limit is enforced), but since each item has significant overhead
+    this limit is enforced) - since each item has significant overhead
     (32 bytes at minimum), it should not be used for simple shared variables.
-    Items are not allowed to have size of zero.
+    Note that items are not allowed to have size of zero.
 
-    The size of the item is kind-of domain separation - items with equal size
-    are "living" in the same space, and items with differing sizes are kept
-    completely separate.
-    So two items with the same name but differing sizes are distinct. Two items
-    with equal size but differing name are also distinct. But two items with
-    equal both size and name will point to the same shared memory.
-    Given the implementation, do not use this to create many items with
-    differing sizes, as each size-space has somewhat high overhead (200+KiB).
+    All created items are placed in one shared memory, so it is desirable to
+    split them into smaller groups that will not interfere.
+    There is a NameSpace parameter for this purpose. It is a short string
+    (maximum length of 32 character) that, along with item size, creates
+    distinct groups of items.
+    So, two items can be in the same group only if their namespace and size
+    both matches, otherwise they are created in a separate groups.
+    Given the abovementioned, do not use this library to create many items with
+    differing sizes or namespaces, as each group has somewhat high overhead
+    (128KiB+).
 
-    The items are in fact not discerned by their full name, they are discerned
-    by a cryptographic hash (SHA1) of their name. So there is a very small, but
-    still non-zero, posibility of name conflicts. Be aware of that.
-    
-    Length of the item name is not explicitly limited.
+    If you create a new item, it is in the same group and has the same name as
+    already existing one, then both items will occupy the same memory, allowing
+    for effective sharing of data (note that reference count is managed
+    internally).    
 
-  Version 1.0 alpha (2021-12-18) - needs serious testing
+    The idividual items are in fact not discerned by their full name, they are
+    discerned by a cryptographic hash (SHA1) of their name. So there is a very
+    small, but still non-zero, posibility of name conflicts. Be aware of that.
 
-  Last change 2021-12-18
+    Length of the item name is not explicitly limited, but is not recommended
+    to be zero.
+
+  Version 1.1 (2021-12-19) - still needs serious testing
+
+  Last change 2021-12-19
 
   ©2021-2022 František Milt
 
@@ -106,6 +114,7 @@ type
 type
   TNamedSharedItem = class(TCustomObject)
   protected
+    fNameSpace:         String;
     fName:              String;
     fNameHash:          TSHA1;
     fSize:              TMemSize;
@@ -122,11 +131,12 @@ type
     procedure FindOrAllocateItem; virtual;
     procedure AllocateItem; virtual;
     procedure DeallocateItem; virtual;
-    procedure Initialize(const Name: String; Size: TMemSize); virtual;
+    procedure Initialize(const Name: String; Size: TMemSize; const NameSpace: String); virtual;
     procedure Finalize; virtual;
   public
-    constructor Create(const Name: String; Size: TMemSize);
+    constructor Create(const Name: String; Size: TMemSize; const NameSpace: String = '');
     destructor Destroy; override;
+    property NameSpace: String read fNameSpace;
     property Name: String read fName;
     property Size: TMemSize read fSize;
     property Memory: Pointer read fPayloadMemory;
@@ -142,6 +152,9 @@ uses
                                 TNamedSharedItem
 --------------------------------------------------------------------------------
 ===============================================================================}
+const
+  NSI_SHAREDMEMORY_NAMESPACE_MAXLEN = 32;
+
 {-------------------------------------------------------------------------------
     TNamedSharedItem - info section types and constants
 -------------------------------------------------------------------------------}
@@ -164,7 +177,7 @@ type
   PNSIInfoSection = ^TNSIInfoSection;
 
 const
-  NSI_SHAREDMEMORY_INFOSECT_NAME = 'nsi_section_%d_info';  // size
+  NSI_SHAREDMEMORY_INFOSECT_NAME = 'nsi_section%s_%d_info';   // namespace, size
   NSI_SHAREDMEMORY_INFOSECT_SIZE = SizeOf(TNSIInfoSection);
 
   NSI_INFOSECT_FLAG_ACTIVE = UInt32($00000001);
@@ -185,10 +198,10 @@ type
   PNSIItemHeader = ^TNSIItemHeader;
 
 const
-  NSI_SHAREDMEMORY_DATASECT_ALIGNMENT   = 32;                   // 256 bits
-  NSI_SHAREDMEMORY_DATASECT_MAXITEMSIZE = 1024;                 // 1KiB
-  NSI_SHAREDMEMORY_DATASECT_SIZE        = 64 * 1024;            // 64KiB
-  NSI_SHAREDMEMORY_DATASECT_NAME        = 'nsi_section_%d_%d';  // size, index
+  NSI_SHAREDMEMORY_DATASECT_ALIGNMENT   = 32;                     // 256 bits
+  NSI_SHAREDMEMORY_DATASECT_MAXITEMSIZE = 1024;                   // 1KiB
+  NSI_SHAREDMEMORY_DATASECT_SIZE        = 64 * 1024;              // 64KiB
+  NSI_SHAREDMEMORY_DATASECT_NAME        = 'nsi_section%s_%d_%d';  // namespace, size, index
 
 {===============================================================================
     TNamedSharedItem - class implementation
@@ -199,14 +212,14 @@ const
 
 Function TNamedSharedItem.GetInfoSectionName: String;
 begin
-Result := Format(NSI_SHAREDMEMORY_INFOSECT_NAME,[fSize])
+Result := Format(NSI_SHAREDMEMORY_INFOSECT_NAME,[fNameSpace,fSize])
 end;
 
 //------------------------------------------------------------------------------
 
 Function TNamedSharedItem.GetDataSectionName(Index: Integer): String;
 begin
-Result := Format(NSI_SHAREDMEMORY_DATASECT_NAME,[fSize,Index])
+Result := Format(NSI_SHAREDMEMORY_DATASECT_NAME,[fNameSpace,fSize,Index])
 end;
 
 //------------------------------------------------------------------------------
@@ -374,8 +387,14 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TNamedSharedItem.Initialize(const Name: String; Size: TMemSize);
+procedure TNamedSharedItem.Initialize(const Name: String; Size: TMemSize; const NameSpace: String);
 begin
+If Length(NameSpace) <= 0 then
+  fNameSpace := ''
+else If Length(NameSpace) <= NSI_SHAREDMEMORY_NAMESPACE_MAXLEN then
+  fNameSpace := '_' + NameSpace
+else
+  raise ENSIInvalidValue.Create('TNamedSharedItem.Initialize: Namespace string too long.');
 fName := Name;
 fNameHash := WideStringSHA1(StrToWide(fName));
 If (Size > 0) and (Size <= NSI_SHAREDMEMORY_DATASECT_MAXITEMSIZE) then
@@ -415,10 +434,10 @@ end;
     TNamedSharedItem - public methods
 -------------------------------------------------------------------------------}
 
-constructor TNamedSharedItem.Create(const Name: String; Size: TMemSize);
+constructor TNamedSharedItem.Create(const Name: String; Size: TMemSize; const NameSpace: String = '');
 begin
 inherited Create;
-Initialize(Name,Size);
+Initialize(Name,Size,NameSpace);
 end;
 
 //------------------------------------------------------------------------------
