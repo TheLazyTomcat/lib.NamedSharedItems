@@ -9,7 +9,30 @@
 
   Shared named items
 
-  Version 1.0 alpha (2021-12-18)
+    Provides a class (TNamedSharedItem) to be used for small named shared
+    (system-wide) memory blocks (here named items).
+
+    It is inteded only for shared objects or medium-size data (at most 1KiB,
+    this limit is enforced), but since each item has significant overhead
+    (32 bytes at minimum), it should not be used for simple shared variables.
+    Items are not allowed to have size of zero.
+
+    The size of the item is kind-of domain separation - items with equal size
+    are "living" in the same space, and items with differing sizes are kept
+    completely separate.
+    So two items with the same name but differing sizes are distinct. Two items
+    with equal size but differing name are also distinct. But two items with
+    equal both size and name will point to the same shared memory.
+    Given the implementation, do not use this to create many items with
+    differing sizes, as each size-space has somewhat high overhead (200+KiB).
+
+    The items are in fact not discerned by their full name, they are discerned
+    by a cryptographic hash (SHA1) of their name. So there is a very small, but
+    still non-zero, posibility of name conflicts. Be aware of that.
+    
+    Length of the item name is not explicitly limited.
+
+  Version 1.0 alpha (2021-12-18) - needs serious testing
 
   Last change 2021-12-18
 
@@ -36,12 +59,17 @@
     SharedMemoryStream - github.com/TheLazyTomcat/Lib.SharedMemoryStream
     StrRect            - github.com/TheLazyTomcat/Lib.StrRect
     BitOps             - github.com/TheLazyTomcat/Lib.BitOps
-
     HashBase           - github.com/TheLazyTomcat/Lib.HashBase
     StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
   * SimpleCPUID        - github.com/TheLazyTomcat/Lib.SimpleCPUID
   * InterlockedOps     - github.com/TheLazyTomcat/Lib.InterlockedOps
-  * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex      
+  * SimpleFutex        - github.com/TheLazyTomcat/Lib.SimpleFutex
+
+  Libraries SimpleFutex and InterlockedOps are required only when compiling for
+  Linux operating system.
+
+  SimpleCPUID might not be required, depending on defined symbols in libraries
+  InterlockedOps and BitOps.
 
 ===============================================================================}
 unit NamedSharedItems;
@@ -64,6 +92,7 @@ type
   ENSIException = class(Exception);
 
   ENSIInvalidValue        = class(ENSIException);
+  ENSIOutOfResources      = class(ENSIException);
   ENSIItemAllocationError = class(ENSIException);
 
 {===============================================================================
@@ -82,16 +111,15 @@ type
     fSize:              TMemSize;
     fInfoSection:       TSharedMemory;
     fDataSectionIndex:  Integer;
-    fDataSection:       TSharedMemory;
-    fMemory:            Pointer;
+    fDataSection:       TSimpleSharedMemory;  // no locking (to save some resources)
+    fItemMemory:        Pointer;
     fPayloadMemory:     Pointer;
     // some helper fields
     fFullItemSize:      TMemSize;
     fItemsPerSection:   UInt32;
     Function GetInfoSectionName: String; virtual;
     Function GetDataSectionName(Index: Integer): String; virtual;
-    Function ProbeSectionsForItem: Boolean; virtual;
-    procedure AllocateNewItem; virtual;
+    procedure FindOrAllocateItem; virtual;
     procedure AllocateItem; virtual;
     procedure DeallocateItem; virtual;
     procedure Initialize(const Name: String; Size: TMemSize); virtual;
@@ -114,54 +142,53 @@ uses
                                 TNamedSharedItem
 --------------------------------------------------------------------------------
 ===============================================================================}
-{
-  Informative section
-}
+{-------------------------------------------------------------------------------
+    TNamedSharedItem - info section types and constants
+-------------------------------------------------------------------------------}
 const
-  NSI_SHAREDMEMORY_INFOSECT_MAXCOUNT = 16 * 1024;              // total 1GiB of memory with 64KiB data sections
-  NSI_SHAREDMEMORY_INFOSECT_NAME     = 'nsi_section_%d_info';  // size
+  NSI_SHAREDMEMORY_INFOSECT_MAXCOUNT = 16 * 1024; // total 1GiB of memory with 64KiB data sections
 
 type
   TNSIDataSectionInfo = packed record
-    ItemCount:  UInt32;
+    ItemCount:  UInt32; // number of taken item slots within this data section
     Flags:      UInt32; // unused atm
   end;
 
-  TNSIDataSectionsInfo = packed array[0..Pred(NSI_SHAREDMEMORY_INFOSECT_MAXCOUNT)] of TNSIDataSectionInfo;
+  TNSIDataSectionsArray = packed array[0..Pred(NSI_SHAREDMEMORY_INFOSECT_MAXCOUNT)] of TNSIDataSectionInfo;
 
-  TNSIInfoSectionRec = packed record
+  TNSIInfoSection = packed record
     Flags:        UInt32;
     Reserved:     array[0..27] of Byte;
-    DataSections: TNSIDataSectionsInfo;
+    DataSections: TNSIDataSectionsArray;
   end;
-  PNSIInfoSectionRec = ^TNSIInfoSectionRec;
+  PNSIInfoSection = ^TNSIInfoSection;
 
 const
-  NSI_SHAREDMEMORY_INFOSECT_SIZE = SizeOf(TNSIInfoSectionRec);
+  NSI_SHAREDMEMORY_INFOSECT_NAME = 'nsi_section_%d_info';  // size
+  NSI_SHAREDMEMORY_INFOSECT_SIZE = SizeOf(TNSIInfoSection);
 
   NSI_INFOSECT_FLAG_ACTIVE = UInt32($00000001);
 
-//------------------------------------------------------------------------------
-{
-  Data section
-}
-const
-  NSI_SHAREDMEMORY_DATASECT_MAXITEMSIZE = 1024;                 // 1KiB
-  NSI_SHAREDMEMORY_DATASECT_ALIGNMENT   = 32;
-  NSI_SHAREDMEMORY_DATASECT_SIZE        = 64 * 1024;            // 64KiB
-  NSI_SHAREDMEMORY_DATASECT_NAME        = 'nsi_section_%d_%d';  // size, index
-
+{-------------------------------------------------------------------------------
+    TNamedSharedItem - data section types and constants
+-------------------------------------------------------------------------------}
 type
   TNSIItemPayload = record end; // zero-size placeholder
 
   TNSIItemHeader = packed record
-    RefCount: UInt32;
-    Flags:    UInt32;                 // currently unused
-    Hash:     TSHA1;                  // 20 bytes
-    Reserved: array[0..3] of Byte;    // right now only padding
-    Payload:  TNSIItemPayload         // should be aligned to 32-byte boundary
+    RefCount: UInt32;               // reference counter
+    Flags:    UInt32;               // currently unused
+    Hash:     TSHA1;                // 20 bytes
+    Reserved: array[0..3] of Byte;  // right now only alignment padding
+    Payload:  TNSIItemPayload       // aligned to 32-byte boundary
   end;
   PNSIItemHeader = ^TNSIItemHeader;
+
+const
+  NSI_SHAREDMEMORY_DATASECT_ALIGNMENT   = 32;                   // 256 bits
+  NSI_SHAREDMEMORY_DATASECT_MAXITEMSIZE = 1024;                 // 1KiB
+  NSI_SHAREDMEMORY_DATASECT_SIZE        = 64 * 1024;            // 64KiB
+  NSI_SHAREDMEMORY_DATASECT_NAME        = 'nsi_section_%d_%d';  // size, index
 
 {===============================================================================
     TNamedSharedItem - class implementation
@@ -184,144 +211,140 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function TNamedSharedItem.ProbeSectionsForItem: Boolean;
+procedure TNamedSharedItem.FindOrAllocateItem;
+var
+  InfoSectionPtr:       PNSIInfoSection;
+  i,j:                  Integer;
+  SectionFirstUnused:   Integer;
+  SectionFirstFreeSlot: Integer;
+  ProbedSection:        TSimpleSharedMemory;
+  ProbedItem:           PNSIItemHeader;
+begin
+// info section should be already locked and prepared by this point
+InfoSectionPtr := PNSIInfoSection(fInfoSection.Memory);
+SectionFirstUnused := -1;
+SectionFirstFreeSlot := -1;
+{
+  Traverse all sections and, in those containing at least one item, search for
+  occurence of item with the same hash as has this item. Along the way, look
+  for empty slots and unused sections.
 
-  Function ProbeSection(const Name: String; out Section: TSharedMemory; out ItemPtr: PNSIItemHeader): Boolean;
-  var
-    ii: Integer;
+  Since all data sections are traversed, if the item is not found, there should
+  be at least one section unused and/or one with free slot. If not, it indicates
+  that all resources (cca. 1GiB of memory) has been consumed, in that case just
+  raise exception.
+}
+For i := Low(InfoSectionPtr^.DataSections) to High(InfoSectionPtr^.DataSections) do
   begin
-    Result := False;
-    ItemPtr := nil;
-    Section := TSharedMemory.Create(NSI_SHAREDMEMORY_DATASECT_SIZE,Name);
-    try
-      Section.Lock;
-      try
-        ItemPtr := PNSIItemHeader(Section.Memory);
-        For ii := 1 to fItemsPerSection do
-          begin
-            If ItemPtr^.RefCount > 0 then
-              If SameSHA1(ItemPtr^.Hash,fNameHash) then
-                begin
-                  Inc(ItemPtr^.RefCount);
-                  Result := True;
-                  Break{For ii};
-                end;
-            PtrAdvanceVar(Pointer(ItemPtr),fFullItemSize);
-          end;
-      finally
-        Section.Unlock;
-      end;
-    finally
-      If not Result then
-        begin
-          FreeAndNil(Section);
-          ItemPtr := nil;
+    If InfoSectionPtr^.DataSections[i].ItemCount > 0 then
+      begin
+        // this section is used...
+        If (InfoSectionPtr^.DataSections[i].ItemCount < fItemsPerSection) then
+          // ...and is not full
+          If SectionFirstFreeSlot < 0 then
+            SectionFirstFreeSlot := i;
+        // probe this section for this item
+        ProbedSection := TSimpleSharedMemory.Create(NSI_SHAREDMEMORY_DATASECT_SIZE,GetDataSectionName(i));
+        try
+          ProbedItem := PNSIItemHeader(ProbedSection.Memory);
+          For j := 1 to fItemsPerSection do
+            begin
+              If ProbedItem^.RefCount > 0 then
+                If SameSHA1(ProbedItem^.Hash,fNameHash) then
+                  begin
+                    Inc(ProbedItem^.RefCount);
+                    fDataSectionIndex := i;
+                    fDataSection := ProbedSection;
+                    fItemMemory := Pointer(ProbedItem);
+                    Exit; // also breaks out of the for cycle
+                  end;
+              PtrAdvanceVar(Pointer(ProbedItem),fFullItemSize);
+            end;
+          FreeAndNil(ProbedSection);  // not called if the item was found
+        except
+          // in case something bad happens during probing
+          FreeAndNil(ProbedSection);
+          raise;
         end;
+      end
+    else
+      begin
+        // this section is unused
+        If SectionFirstUnused < 0 then
+          SectionFirstUnused := i;
+      end;
+  end;
+{
+  If here then the item was not found, add it as a new one.
+  
+  First try adding it into already used section, so we don't have to allocate
+  new section.
+}
+If SectionFirstFreeSlot >= 0 then
+  begin
+    fDataSectionIndex := SectionFirstFreeSlot;
+    ProbedSection := TSimpleSharedMemory.Create(NSI_SHAREDMEMORY_DATASECT_SIZE,GetDataSectionName(fDataSectionIndex));
+    try
+      ProbedItem := PNSIItemHeader(ProbedSection.Memory);
+      For j := 1 to fItemsPerSection do
+        begin
+          If ProbedItem^.RefCount <= 0 then
+            begin
+              FillChar(ProbedItem^,fFullItemSize,0);
+              ProbedItem^.RefCount := 1;
+              ProbedItem^.Hash := fNameHash;
+              fDataSection := ProbedSection;
+              fItemMemory := Pointer(ProbedItem);
+              Inc(InfoSectionPtr^.DataSections[fDataSectionIndex].ItemCount);
+              Exit;
+            end;
+          PtrAdvanceVar(Pointer(ProbedItem),fFullItemSize);
+        end;
+      raise ENSIOutOfResources.CreateFmt('TNamedSharedItem.FindOrAllocateItem: No free item slot found in given section (%d).',[fDataSectionIndex]);
+    except
+      FreeAndNil(ProbedSection);
+      raise;
+    end;
+  end
+else If SectionFirstUnused >= 0 then
+  begin
+    fDataSectionIndex := SectionFirstUnused;
+    fDataSection := TSimpleSharedMemory.Create(NSI_SHAREDMEMORY_DATASECT_SIZE,GetDataSectionName(fDataSectionIndex));
+    try
+      fItemMemory := fDataSection.Memory;
+      PNSIItemHeader(fItemMemory)^.RefCount := 1;
+      PNSIItemHeader(fItemMemory)^.Hash := fNameHash;
+      InfoSectionPtr^.DataSections[fDataSectionIndex].ItemCount := 1;
+      Exit;
+    except
+      FreeAndNil(fDataSection);
+      raise;
     end;
   end;
-
-var
-  i:              Integer;
-  InfoSectionPtr: PNSIInfoSectionRec;
-  ProbedSection:  TSharedMemory;
-  ProbedItem:     PNSIItemHeader;
-begin
-Result := False;
-InfoSectionPtr := PNSIInfoSectionRec(fInfoSection.Memory);
-// info section should be already locked and prepared by this point
-For i := Low(InfoSectionPtr^.DataSections) to High(InfoSectionPtr^.DataSections) do
-  If InfoSectionPtr^.DataSections[i].ItemCount > 0 then
-    If ProbeSection(GetDataSectionName(i),ProbedSection,ProbedItem) then
-      begin
-        // existing item found
-        fDataSectionIndex := i;
-        fDataSection := ProbedSection;
-        fMemory := Pointer(ProbedItem);
-        Result := True;
-        Break{For i};
-      end;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure TNamedSharedItem.AllocateNewItem;
-var
-  i,j:            Integer;
-  InfoSectionPtr: PNSIInfoSectionRec;
-  ItemPtr:        PNSIItemHeader;
-begin
-InfoSectionPtr := PNSIInfoSectionRec(fInfoSection.Memory);
-// first search for already used sections, so we don't have allocate a new one
-For i := Low(InfoSectionPtr^.DataSections) to High(InfoSectionPtr^.DataSections) do
-  If (InfoSectionPtr^.DataSections[i].ItemCount > 0) and (InfoSectionPtr^.DataSections[i].ItemCount < fItemsPerSection) then
-    begin
-      // this section seems to be used and there are free slots
-      fDataSectionIndex := i;
-      fDataSection := TSharedMemory.Create(NSI_SHAREDMEMORY_DATASECT_SIZE,GetDataSectionName(i));
-      fDataSection.Lock;
-      try
-        ItemPtr := PNSIItemHeader(fDataSection.Memory);
-        // find free slot
-        For j := 1 to fItemsPerSection do
-          begin
-            If ItemPtr^.RefCount <= 0 then
-              begin
-                FillChar(ItemPtr^,fFullItemSize,0);
-                ItemPtr^.RefCount := 1;
-                ItemPtr^.Hash := fNameHash;
-                fMemory := Pointer(ItemPtr);
-                Inc(InfoSectionPtr^.DataSections[i].ItemCount);
-                Exit;
-              end;
-            PtrAdvanceVar(Pointer(ItemPtr),fFullItemSize);
-          end;
-      finally
-        fDataSection.Unlock;
-      end;
-    end;
-// no free slot found in already used sections, allocate new one
-For i := Low(InfoSectionPtr^.DataSections) to High(InfoSectionPtr^.DataSections) do
-  If InfoSectionPtr^.DataSections[i].ItemCount <= 0 then
-    begin
-      fDataSectionIndex := i;
-      fDataSection := TSharedMemory.Create(NSI_SHAREDMEMORY_DATASECT_SIZE,GetDataSectionName(i));
-      fDataSection.Lock;
-      try
-        ItemPtr := PNSIItemHeader(fDataSection.Memory);
-        ItemPtr^.RefCount := 1;
-        ItemPtr^.Hash := fNameHash; 
-        fMemory := Pointer(ItemPtr);
-        InfoSectionPtr^.DataSections[i].ItemCount := 1;
-        Break{For i};
-      finally
-        fDataSection.Unlock;
-      end;      
-    end;
+raise ENSIOutOfResources.Create('TNamedSharedItem.FindOrAllocateItem: No free item slot found.');
 end;
 
 //------------------------------------------------------------------------------
 
 procedure TNamedSharedItem.AllocateItem;
 begin
-// Get info section, initialize it if necessary.
+// get info section, initialize it if necessary
 fInfoSection := TSharedMemory.Create(NSI_SHAREDMEMORY_INFOSECT_SIZE,GetInfoSectionName);
 fInfoSection.Lock;
 try
-  If PNSIInfoSectionRec(fInfoSection.Memory)^.Flags and NSI_INFOSECT_FLAG_ACTIVE = 0 then
+  If PNSIInfoSection(fInfoSection.Memory)^.Flags and NSI_INFOSECT_FLAG_ACTIVE = 0 then
     begin
       // section not initialized, initialize it
-      PNSIInfoSectionRec(fInfoSection.Memory)^.Flags := NSI_INFOSECT_FLAG_ACTIVE;
-      FillChar(PNSIInfoSectionRec(fInfoSection.Memory)^.DataSections,SizeOf(TNSIDataSectionsInfo),0);
+      PNSIInfoSection(fInfoSection.Memory)^.Flags := NSI_INFOSECT_FLAG_ACTIVE;
+      FillChar(PNSIInfoSection(fInfoSection.Memory)^.DataSections,SizeOf(TNSIDataSectionsArray),0);
     end;
-  If not ProbeSectionsForItem then
-    // section with given name does not yet exist, allocate new one
-    AllocateNewItem;
+  FindOrAllocateItem;  
 finally
   fInfoSection.Unlock;
 end;
-If (fDataSectionIndex < 0) or not Assigned(fDataSection) or not Assigned(fMemory) then
+If (fDataSectionIndex < 0) or not Assigned(fDataSection) or not Assigned(fItemMemory) then
   raise ENSIItemAllocationError.Create('TNamedSharedItem.AllocateItem: No free item slot found.');
-fPayloadMemory := Addr(PNSIItemHeader(fMemory)^.Payload);
+fPayloadMemory := Addr(PNSIItemHeader(fItemMemory)^.Payload);
 end;
 
 //------------------------------------------------------------------------------
@@ -334,17 +357,12 @@ If Assigned(fInfoSection) then
     try
       If Assigned(fDataSection) then
         begin
-          fDataSection.Lock;
-          try
-            Dec(PNSIItemHeader(fMemory)^.RefCount);
-            If PNSIItemHeader(fMemory)^.RefCount <= 0 then
-              begin
-                PNSIItemHeader(fMemory)^.RefCount := 0;
-                Dec(PNSIInfoSectionRec(fInfoSection.Memory)^.DataSections[fDataSectionIndex].ItemCount);
-              end;
-          finally
-            fDataSection.Unlock;
-          end;
+          Dec(PNSIItemHeader(fItemMemory)^.RefCount);
+          If PNSIItemHeader(fItemMemory)^.RefCount <= 0 then
+            begin
+              PNSIItemHeader(fItemMemory)^.RefCount := 0;
+              Dec(PNSIInfoSection(fInfoSection.Memory)^.DataSections[fDataSectionIndex].ItemCount);
+            end;
           FreeAndNil(fDataSection);
         end;
     finally
@@ -367,7 +385,7 @@ else
 fInfoSection := nil;
 fDataSectionIndex := -1;
 fDataSection := nil;
-fMemory := nil;
+fItemMemory := nil;
 fPayloadMemory := nil;
 {
   Get size of item with everything (header, padding, ...).
