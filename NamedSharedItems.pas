@@ -40,9 +40,9 @@
     Length of the item name is not explicitly limited, but is not recommended
     to be zero.
 
-  Version 1.1 (2021-12-19) - still needs serious testing
+  Version 1.1.1 (2022-02-16) - still needs serious testing
 
-  Last change 2021-12-19
+  Last change 2022-02-16
 
   ©2021-2022 František Milt
 
@@ -136,6 +136,8 @@ type
   public
     constructor Create(const Name: String; Size: TMemSize; const NameSpace: String = '');
     destructor Destroy; override;
+    procedure GlobalLock; virtual;
+    procedure GlobalUnlock; virtual;
     property NameSpace: String read fNameSpace;
     property Name: String read fName;
     property Size: TMemSize read fSize;
@@ -446,6 +448,20 @@ destructor TNamedSharedItem.Destroy;
 begin
 Finalize;
 inherited;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TNamedSharedItem.GlobalLock;
+begin
+fInfoSection.Lock;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure TNamedSharedItem.GlobalUnlock;
+begin
+fInfoSection.Unlock;
 end;
 
 end.
