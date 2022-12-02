@@ -15,12 +15,12 @@
     It is inteded only for shared objects or medium-size data (at most 1KiB,
     this limit is enforced) - since each item has significant overhead
     (32 bytes at minimum), it should not be used for simple shared variables.
-    Note that items are not allowed to have size of zero.
+    Note that items are not allowed to have a size of zero.
 
     All created items are placed in one shared memory, so it is desirable to
     split them into smaller groups that will not interfere.
     There is a NameSpace parameter for this purpose. It is a short string
-    (maximum length of 32 character) that, along with item size, creates
+    (maximum length of 32 characters) that, along with item size, creates
     distinct groups of items.
     So, two items can be in the same group only if their namespace and size
     both matches, otherwise they are created in a separate groups.
@@ -30,8 +30,8 @@
 
     If you create a new item, it is in the same group and has the same name as
     already existing one, then both items will occupy the same memory, allowing
-    for effective sharing of data (note that reference count is managed
-    internally).    
+    for effective sharing of data (note that a reference count is managed
+    internally).
 
     The idividual items are in fact not discerned by their full name, they are
     discerned by a cryptographic hash (SHA1) of their name. So there is a very
@@ -40,9 +40,9 @@
     Length of the item name is not explicitly limited, but is not recommended
     to be zero.
 
-  Version 1.1.1 (2022-02-16) - still needs serious testing
+  Version 1.1.2 (2022-12-02) - still needs serious testing
 
-  Last change 2022-02-16
+  Last change 2022-12-02
 
   ©2021-2022 František Milt
 
@@ -129,12 +129,24 @@ type
     Function GetInfoSectionName: String; virtual;
     Function GetDataSectionName(Index: Integer): String; virtual;
     procedure FindOrAllocateItem; virtual;
-    procedure AllocateItem; virtual;
+    procedure AllocateItem(HoldLock: Boolean); virtual;
     procedure DeallocateItem; virtual;
-    procedure Initialize(const Name: String; Size: TMemSize; const NameSpace: String); virtual;
+    procedure Initialize(const Name: String; Size: TMemSize; const NameSpace: String; HoldLock: Boolean); virtual;
     procedure Finalize; virtual;
   public
     constructor Create(const Name: String; Size: TMemSize; const NameSpace: String = '');
+  {
+    Use CreateLocked when you need to create and intialize the item in an
+    atomic manner. The entire underlying system stays globally locked (as if
+    method GlobalLock was called) when the constructor returns (unless an
+    exception is raised in the constructor, in which case the lock is not kept),
+    so no new item can be created or removed anywhere in the system. Do the
+    initialization quickly to prevent unnecessary lockups.
+
+      WARNING - remember to unlock the item using method GlobalUnlock when you
+                are done!
+  }
+    constructor CreateLocked(const Name: String; Size: TMemSize; const NameSpace: String = ''{$IFNDEF FPC}; Dummy: Integer = 0{$ENDIF});
     destructor Destroy; override;
     procedure GlobalLock; virtual;
     procedure GlobalUnlock; virtual;
@@ -179,7 +191,7 @@ type
   PNSIInfoSection = ^TNSIInfoSection;
 
 const
-  NSI_SHAREDMEMORY_INFOSECT_NAME = 'nsi_section%s_%d_info';   // namespace, size
+  NSI_SHAREDMEMORY_INFOSECT_NAME = 'nsi_section_%s_%d_info';   // namespace, size
   NSI_SHAREDMEMORY_INFOSECT_SIZE = SizeOf(TNSIInfoSection);
 
   NSI_INFOSECT_FLAG_ACTIVE = UInt32($00000001);
@@ -203,7 +215,7 @@ const
   NSI_SHAREDMEMORY_DATASECT_ALIGNMENT   = 32;                     // 256 bits
   NSI_SHAREDMEMORY_DATASECT_MAXITEMSIZE = 1024;                   // 1KiB
   NSI_SHAREDMEMORY_DATASECT_SIZE        = 64 * 1024;              // 64KiB
-  NSI_SHAREDMEMORY_DATASECT_NAME        = 'nsi_section%s_%d_%d';  // namespace, size, index
+  NSI_SHAREDMEMORY_DATASECT_NAME        = 'nsi_section_%s_%d_%d';  // namespace, size, index
 
 {===============================================================================
     TNamedSharedItem - class implementation
@@ -341,25 +353,31 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TNamedSharedItem.AllocateItem;
+procedure TNamedSharedItem.AllocateItem(HoldLock: Boolean);
 begin
 // get info section, initialize it if necessary
 fInfoSection := TSharedMemory.Create(NSI_SHAREDMEMORY_INFOSECT_SIZE,GetInfoSectionName);
 fInfoSection.Lock;
 try
-  If PNSIInfoSection(fInfoSection.Memory)^.Flags and NSI_INFOSECT_FLAG_ACTIVE = 0 then
-    begin
-      // section not initialized, initialize it
-      PNSIInfoSection(fInfoSection.Memory)^.Flags := NSI_INFOSECT_FLAG_ACTIVE;
-      FillChar(PNSIInfoSection(fInfoSection.Memory)^.DataSections,SizeOf(TNSIDataSectionsArray),0);
-    end;
-  FindOrAllocateItem;  
+  try
+    If PNSIInfoSection(fInfoSection.Memory)^.Flags and NSI_INFOSECT_FLAG_ACTIVE = 0 then
+      begin
+        // section not initialized, initialize it
+        PNSIInfoSection(fInfoSection.Memory)^.Flags := NSI_INFOSECT_FLAG_ACTIVE;
+        FillChar(PNSIInfoSection(fInfoSection.Memory)^.DataSections,SizeOf(TNSIDataSectionsArray),0);
+      end;
+    FindOrAllocateItem;
+    If (fDataSectionIndex < 0) or not Assigned(fDataSection) or not Assigned(fItemMemory) then
+      raise ENSIItemAllocationError.Create('TNamedSharedItem.AllocateItem: No free item slot found.');
+    fPayloadMemory := Addr(PNSIItemHeader(fItemMemory)^.Payload);
+  except
+    HoldLock := False;
+    raise;
+  end;
 finally
-  fInfoSection.Unlock;
+  If not HoldLock then
+    fInfoSection.Unlock;
 end;
-If (fDataSectionIndex < 0) or not Assigned(fDataSection) or not Assigned(fItemMemory) then
-  raise ENSIItemAllocationError.Create('TNamedSharedItem.AllocateItem: No free item slot found.');
-fPayloadMemory := Addr(PNSIItemHeader(fItemMemory)^.Payload);
 end;
 
 //------------------------------------------------------------------------------
@@ -389,12 +407,12 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure TNamedSharedItem.Initialize(const Name: String; Size: TMemSize; const NameSpace: String);
+procedure TNamedSharedItem.Initialize(const Name: String; Size: TMemSize; const NameSpace: String; HoldLock: Boolean);
 begin
 If Length(NameSpace) <= 0 then
   fNameSpace := ''
 else If Length(NameSpace) <= NSI_SHAREDMEMORY_NAMESPACE_MAXLEN then
-  fNameSpace := '_' + NameSpace
+  fNameSpace := NameSpace
 else
   raise ENSIInvalidValue.Create('TNamedSharedItem.Initialize: Namespace string too long.');
 fName := Name;
@@ -422,7 +440,7 @@ fFullItemSize := (TMemSize(SizeOf(TNSIItemHeader)) + fSize +
   given data section.
 }
 fItemsPerSection := NSI_SHAREDMEMORY_DATASECT_SIZE div fFullItemSize;
-AllocateItem;
+AllocateItem(HoldLock);
 end;
 
 //------------------------------------------------------------------------------
@@ -439,7 +457,15 @@ end;
 constructor TNamedSharedItem.Create(const Name: String; Size: TMemSize; const NameSpace: String = '');
 begin
 inherited Create;
-Initialize(Name,Size,NameSpace);
+Initialize(Name,Size,NameSpace,False);
+end;
+
+//------------------------------------------------------------------------------
+
+constructor TNamedSharedItem.CreateLocked(const Name: String; Size: TMemSize; const NameSpace: String = ''{$IFNDEF FPC}; Dummy: Integer = 0{$ENDIF});
+begin
+inherited Create;
+Initialize(Name,Size,NameSpace,True);
 end;
 
 //------------------------------------------------------------------------------
