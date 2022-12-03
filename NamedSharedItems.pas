@@ -40,9 +40,9 @@
     Length of the item name is not explicitly limited, but is not recommended
     to be zero.
 
-  Version 1.1.2 (2022-12-02) - still needs serious testing
+  Version 1.1.3 (2022-12-03)
 
-  Last change 2022-12-02
+  Last change 2022-12-03
 
   ©2021-2022 František Milt
 
@@ -114,6 +114,7 @@ type
 type
   TNamedSharedItem = class(TCustomObject)
   protected
+    fCreated:           Boolean;
     fNameSpace:         String;
     fName:              String;
     fNameHash:          TSHA1;
@@ -150,6 +151,11 @@ type
     destructor Destroy; override;
     procedure GlobalLock; virtual;
     procedure GlobalUnlock; virtual;
+  {
+    Created is true if the item was newly created, false when it already
+    existed and was only opened.
+  }
+    property Created: Boolean read fCreated;
     property NameSpace: String read fNameSpace;
     property Name: String read fName;
     property Size: TMemSize read fSize;
@@ -279,7 +285,9 @@ For i := Low(InfoSectionPtr^.DataSections) to High(InfoSectionPtr^.DataSections)
               If ProbedItem^.RefCount > 0 then
                 If SameSHA1(ProbedItem^.Hash,fNameHash) then
                   begin
+                    // item found
                     Inc(ProbedItem^.RefCount);
+                    fCreated := False;
                     fDataSectionIndex := i;
                     fDataSection := ProbedSection;
                     fItemMemory := Pointer(ProbedItem);
@@ -409,6 +417,7 @@ end;
 
 procedure TNamedSharedItem.Initialize(const Name: String; Size: TMemSize; const NameSpace: String; HoldLock: Boolean);
 begin
+fCreated := True;
 If Length(NameSpace) <= 0 then
   fNameSpace := ''
 else If Length(NameSpace) <= NSI_SHAREDMEMORY_NAMESPACE_MAXLEN then
